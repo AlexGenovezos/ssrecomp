@@ -38,6 +38,7 @@ enable_language(ASM)
 
 # Recompiled game code, produced by tools/recomp.py.
 include("${SSR_GENERATED_DIR}/sources.cmake")
+include(cmake/GeneratedImages.cmake)
 add_library(gamecode OBJECT ${RC_GENERATED_SOURCES})
 target_include_directories(gamecode PRIVATE melonDS/src runtime "${SSR_GENERATED_DIR}")
 # Generated code is huge and uniform; -O1 keeps build times reasonable.

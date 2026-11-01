@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rebuilding after game changes refreshes the embedded section images, avoiding
+  stale data that forced the new build back to the interpreter.
 - Keep save, shop and choice-menu screen detection working when building from
   the game fork's renamed functions.
 - Restoring a later snapshot still detects a single-screen game correctly.
