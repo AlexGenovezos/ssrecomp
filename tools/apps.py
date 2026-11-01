@@ -66,9 +66,11 @@ if sys.argv[1] == '--layout':
     sys.exit(0)
 
 from elftools.elf.elffile import ELFFile
+from build_files import linked_image
+from focus_symbols import find_focus
 
 build_dir, out_dir = sys.argv[1], sys.argv[2]
-nef = [f for f in os.listdir(build_dir) if f.endswith('.nef')][0]
+nef = linked_image(build_dir)
 
 NAME = re.compile(r'^(?:g|s)(?:OverlayTemplate|Application|App)_(\w+?)(?:\$\d+)?$')
 SKIP = {'main_defs', 'main_table', 'DTCM', 'ITCM'}
@@ -166,11 +168,10 @@ wanted = [l.split()[0] for l in open(os.path.join(os.path.dirname(os.path.abspat
           if l.strip() and not l.startswith('#')]
 found = []
 for name in wanted:
-    hits = [fn for fn in functions if fn[3] == name]
+    hits = find_focus(functions, name)
     if not hits:
         print('warning: focus symbol not found:', name, file=sys.stderr)
-    for sec, addr, size, _ in hits:
-        found.append((name, sec, addr))
+    found.extend(hits)
 write_table(out_dir, rows, found)
 print(len(rows), 'applications')
 print(len(functions), 'functions in symbols.txt')

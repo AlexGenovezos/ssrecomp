@@ -23,5 +23,6 @@ ssrecomp.cfg
 __pycache__/
 /ssrecomp.rom
 /gen.new/
+.venv/
 /dist/
 .DS_Store

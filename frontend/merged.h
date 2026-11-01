@@ -472,7 +472,7 @@ inline void MergedCompose(const Scene& scene, const ScreenImage screens[2], int 
                 // flash, a full-screen cover), it is continued to the edge of the view;
                 // otherwise the world would still show beside it.
                 const ScreenImage& top = screens[scene.items[0].screen];
-                if (top.flags)
+                if (top.flags && (scene.items[0].drop & 0x7F) != 0x7F)
                 {
                     int sy = (int)((y - v.originY) / v.unit);
                     if (sy >= 0 && sy < 192)

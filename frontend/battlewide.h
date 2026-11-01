@@ -139,8 +139,10 @@ public:
         Back.assign((size_t)outW * 192, 0);
         BackPrio.assign((size_t)outW * 192, 4);
         // Where the wild Pokémon's platform is while it is a sprite (as it slides in).
-        int platLeft = 1 << 20, platRight = -(1 << 20);
+        int platLeft = 1 << 20, platRight = -(1 << 20), platTop = 1 << 20, platBottom = -(1 << 20);
         Boxes.clear();
+        HpMask.assign((size_t)outW * 192, 0);
+        PlatNow.assign((size_t)outW * 192, 0);
         auto outIndex = [&](int x, int y) { return y * outW + x + extend; };
         {
             static const uint8_t sizes[4][4][2] = {
@@ -163,17 +165,20 @@ public:
                 if (oy + sh > 256) oy -= 256;
                 const int objPrio = (a2 >> 10) & 3;
                 const bool front = objPrio == 0;
-                if (objPrio == 3 && oy + sh / 2 < 100 && !affine)
+                const bool platSprite = objPrio == 3 && oy + sh / 2 < 100 && !affine;
+                if (platSprite)
                 {
                     platLeft = std::min(platLeft, ox);
+                    platTop = std::min(platTop, oy);
+                    platBottom = std::max(platBottom, oy + sh);
                     platRight = std::max(platRight, ox + sw);
                 }
                 const int mode = (a0 >> 10) & 3;
                 const bool c256 = a0 & 0x2000;
                 if (mode == 2) continue;                                    // a window, not a picture
-                if (front || !(shown & 0x10)) continue;                     // an HP box, or hidden outside the windows
+                if (!front && !(shown & 0x10)) continue;                    // hidden outside the windows (an HP box is kept apart)
                 if (affine || mode == 3 || (c256 && (dispcnt & (1u << 31)))) continue; // not decoded here
-                if (objPrio != 3) Boxes.push_back({ ox, oy, sw, sh });
+                if (objPrio != 3 && !front) Boxes.push_back({ ox, oy, sw, sh });
                 const u32 tile = a2 & 0x3FF;
                 for (int y = std::max(0, oy); y < std::min(192, oy + sh); y++)
                     for (int x = std::max(ox, -extend); x < std::min(ox + sw, 256 + extend); x++)
@@ -193,14 +198,24 @@ public:
                         const u8 v = nds.GPU.ReadVRAM_OBJ<u8>(objBase + addr);
                         const int idx = c256 ? v : ((px & 1) ? v >> 4 : v & 0xF);
                         if (!idx) continue;
+                        if (front) { HpMask[outIndex(x, y)] = 1; continue; }
                         if (objPrio <= BackPrio[outIndex(x, y)])
                         {
                             BackPrio[outIndex(x, y)] = objPrio;
                             Back[outIndex(x, y)] = colour(palette(objPal + (c256 ? idx : idx + (a2 >> 12) * 16) * 2), 4, y);
+                            if (platSprite) PlatNow[outIndex(x, y)] = Back[outIndex(x, y)];
                         }
                     }
             }
         }
+
+        // An HP box that reaches the edge of the screen is continued beyond it, as the edge is.
+        for (int y = 0; y < 192; y++)
+            for (int x = 0; x < extend; x++)
+            {
+                if (HpMask[outIndex(255, y)]) HpMask[outIndex(256 + x, y)] = 1;
+                if (HpMask[outIndex(0, y)]) HpMask[outIndex(-1 - x, y)] = 1;
+            }
 
         // A trainer leaving the screen (the player, after throwing the Poké Ball) is hidden by
         // the game once it is past the edge of the screen, before it is past the edge of the
@@ -466,12 +481,22 @@ public:
         }
         if (platRight > platLeft)
         {
-            if ((platLeft + platRight) / 2 < 192) Glide = 0;
+            if ((platLeft + platRight) / 2 < 192 && !Settled) Glide = 0;
             else if (!busy) Glide = std::min(1.0f, Glide + 1 / 20.0f);
         }
         else if ((Glide > 0 || Calls > 300) && !busy)                   // after the opening, or joined late
             Glide = std::min(1.0f, Glide + 1 / 20.0f);
+        // Once it has arrived it stays: coming back from the bag or the party, the screen is
+        // briefly seen mid-change, and the Pokémon must not glide over again.
+        const bool wasSettled = Settled;
+        if (Glide >= 1) Settled = true;
+        // Kept as the sprite last showed it while the battle opened; coming back from the bag the
+        // platform slides in again, and that slide must not move it.
+        if (!wasSettled && platRight > platLeft && (platLeft + platRight) / 2 >= 192) { PlatL = platLeft; PlatR = platRight; PlatT = platTop; PlatB = platBottom; Plat = PlatNow; }
         const int enemyShift = (int)std::lround(extend * Glide);
+        // The wild Pokémon and its ground stand two pixels short of the far edge; the player's Pokémon goes out to the near edge, as on a 4:3 screen.
+        const int monShift = (int)std::lround((extend - 2) * Glide);
+        const int playerShift = enemyShift;
 
         const int w = 256 + 2 * extend;
         // The picture as the screen shows it, continued beyond its edges; and where something
@@ -561,6 +586,7 @@ public:
         // rows it is in, and each thing in front of them that is on its side, whole (a move's
         // effect reaching past those rows is not cut in two).
         Move.assign((size_t)w * 192, 0);
+        MoveP.assign((size_t)w * 192, 0);
         if (enemyShift > 0)
         {
             Comp.assign((size_t)w * 192, 0);
@@ -610,6 +636,8 @@ public:
                     for (int p : Members)
                         if (nearerEnemy(p % w - extend, p / w)) Move[p] = 1;
                 }
+                else if (atPlayer && !atEnemy)
+                    for (int p : Members) MoveP[p] = 1;
                 else if (atEnemy || (!atPlayer && nearerEnemy((x0 + x1) / 2 - extend, (y0 + y1) / 2)))
                     for (int p : Members) Move[p] = 1;
             }
@@ -622,13 +650,14 @@ public:
             const uint32_t* pic = &Picture[(size_t)y * w];
             const uint8_t* fg = &Fg[(size_t)y * w];
             const uint8_t* move = &Move[(size_t)y * w];
+            const uint8_t* moveP = &MoveP[(size_t)y * w];
             const uint32_t* plain = &Plain[(size_t)y * w];
             if (enemyShift > 0)
             {
                 // The backgrounds, those of the wild Pokémon's rows moved, with the gap between
                 // the two Pokémon stretched to fill.
                 for (int x = 0; x < w; x++)
-                    row[x] = (y < EnemyBottom ? fg[x] : move[x]) ? plain[x] : pic[x];
+                    row[x] = (y < EnemyBottom ? fg[x] : (move[x] || moveP[x])) ? plain[x] : pic[x];
                 if (y < EnemyBottom)
                 {
                     Row.assign(row, row + w);
@@ -640,10 +669,13 @@ public:
                         row[sx + extend] = Row[from + extend];
                     }
                     for (int x = 0; x < w; x++)
-                        if (fg[x] && !move[x]) row[x] = pic[x];
+                        if (fg[x] && !move[x] && !moveP[x]) row[x] = pic[x];
                 }
-                for (int x = 0; x + enemyShift < w; x++)
-                    if (move[x]) row[x + enemyShift] = pic[x];
+                // (the platform, while it is a sprite, stays put: it is the ground, which has its own height)
+                for (int x = 0; x + monShift < w; x++)
+                    if (move[x] && BackPrio[(size_t)y * w + x] == 3) row[x + monShift] = Back[(size_t)y * w + x];
+                for (int x = playerShift; x < w; x++)
+                    if (moveP[x]) row[x - playerShift] = pic[x];
                 const uint8_t* ui = &Ui[(size_t)y * w];
                 for (int x = 0; x < w; x++)
                     if (ui[x]) row[x] = pic[x];
@@ -673,6 +705,97 @@ public:
                 if (l && shift[l]) row[l == 1 ? sx : sx + 2 * extend] = 0xFF000000 | top.pixels[y * 256 + sx];
             }
         }
+        if (enemyShift > 0 && GroundLift != 0)
+            for (size_t i = 0; i < (size_t)w * 192; i++)
+                HpMask[i] = !Move[i] && Picture[i] != Plain[i];
+        // The ground (the wild Pokémon's platform) moved up or down the screen: the platform, as
+        // its sprite showed it, is taken off the backgrounds (which are plain bands, the same
+        // along a row) and put back at its new height. The HP boxes stay where they are.
+        const int ground = (int)std::lround(GroundLift * Glide);
+        if (enemyShift > 0 && PlatR > PlatL && Plat.size() == (size_t)w * 192)
+        {
+            std::fill(HpMask.begin(), HpMask.end(), 0);
+            for (int y = 0; y < 192; y++)
+                for (int sx = 0; sx < 256; sx++)
+                {
+                    const int l = Label[y * 256 + sx];
+                    if (l && shift[l])
+                    {
+                        const int x = l == 1 ? sx : sx + 2 * extend;
+                        if (x >= 0 && x < w) HpMask[(size_t)y * w + x] = 1;
+                    }
+                }
+            if (ground != 0)
+            {
+                Snap = Pixels;
+                for (int y = 0; y < 192; y++)
+                {
+                    int xl = w, xr = -1;
+                    for (int x = 0; x + monShift < w; x++)
+                        if (Plat[(size_t)y * w + x] || PlatNow[(size_t)y * w + x]) { xl = std::min(xl, x + monShift); xr = std::max(xr, x + monShift); }
+                    if (xr < 0) continue;
+                    const int from = xl - 6 >= 0 ? xl - 6 : std::min(w - 1, xr + 6);
+                    for (int x = xl; x <= xr; x++)
+                    {
+                        const size_t d = (size_t)y * w + x;
+                        if ((!Plat[(size_t)y * w + x - monShift] && !PlatNow[(size_t)y * w + x - monShift]) || Ui[d] || HpMask[d]) continue;
+                        const size_t f = (size_t)y * w + from;
+                        if (!Ui[f] && !HpMask[f]) Pixels[d] = Snap[f];
+                    }
+                }
+                for (int y = 0; y < 192; y++)
+                {
+                    const int dy = y - ground;
+                    if (dy < 0 || dy >= 192) continue;
+                    for (int x = 0; x + monShift < w; x++)
+                    {
+                        const uint32_t c = Plat[(size_t)y * w + x];
+                        const size_t d = (size_t)dy * w + x + monShift;
+                        if (c && !Ui[d] && !HpMask[d]) Pixels[d] = c;
+                    }
+                }
+            }
+        }
+        // The wild Pokémon, lifted with the ground and a little more, clear of the player's HP box.
+        if (enemyShift > 0)
+        {
+            const int lift = (int)std::lround((MonLift + GroundLift) * Glide);
+            for (int y = 0; y < 192; y++)
+            {
+                if (y - lift < 0 || y - lift >= 192) continue;
+                uint32_t* lifted = &Pixels[(size_t)(y - lift) * w];
+                const uint8_t* move = &Move[(size_t)y * w];
+                for (int x = 0; x + monShift < w; x++)
+                    if (move[x] && !(BackPrio[(size_t)y * w + x] == 3 && Back[(size_t)y * w + x] == Picture[(size_t)y * w + x])) lifted[x + monShift] = Picture[(size_t)y * w + x];
+            }
+        }
+        // The player's ground (a background, below the wild Pokémon's rows) moved up the screen;
+        // the player's Pokémon stays where it is.
+        const int playerGround = (int)std::lround(PlayerGroundLift * Glide);
+        // The background ground that replaces the sprite one sits further right than it; brought back to where the sprite was.
+        const int bgShift = platRight > platLeft ? 0 : (int)std::lround(PlayerGroundShift * Glide);
+        if (enemyShift > 0 && (playerGround > 0 || bgShift > 0))
+        {
+            Snap = Pixels;
+            // Rows crossed by the message box (it spans most of the DS width) are never moved; the ground behind it comes from Plain.
+            std::vector<uint8_t> boxRow(192, 0);
+            for (int y = 0; y < 192; y++)
+            {
+                int n = 0;
+                for (int x = extend; x < extend + 256; x++) n += Ui[(size_t)y * w + x];
+                int m = 0; for (int x = extend; x < extend + 256; x++) m += Pixels[(size_t)y*w + x] != Plain[(size_t)y*w + x]; boxRow[y] = n > 180 || m > 200;
+            }
+            for (int y = PlayerGroundTop; y < PlayerGroundBottom; y++)
+                for (int x = 0; x < extend + PlayerGroundRight; x++)
+                {
+                    int sy = std::min(y + playerGround, PlayerGroundBottom - 1);
+                    if (boxRow[sy]) sy = y;
+                    const size_t d = (size_t)y * w + x, s = (size_t)sy * w + std::min(x + bgShift, w - 1);
+                    const bool mine = x + playerShift < w && MoveP[d + playerShift];
+                    if (mine || boxRow[y] || Ui[d] || HpMask[d] || Ui[s] || HpMask[s]) continue;
+                    Pixels[d] = x + playerShift < w && MoveP[s + playerShift] ? Plain[s] : Snap[s];
+                }
+        }
         out = WideImage();
         out.pixels = Pixels.data();
         out.w = w;
@@ -682,10 +805,18 @@ public:
         return true;
     }
 
+    // User-set heights, in screen pixels: the wild Pokémon above its ground, and the ground (its
+    // platform, with the Pokémon on it) up the screen.
+    static constexpr int PlayerGroundTop = 112, PlayerGroundBottom = 192, PlayerGroundShift = 49, PlayerGroundRight = 185;
+    int MonLift = 6, GroundLift = 0, PlayerGroundLift = 5;
+
     // Between battles: the next one opens with the wild Pokémon in its place on the screen.
     void Reset()
     {
         Glide = 0;
+        Settled = false;
+        PlatL = PlatR = PlatT = PlatB = 0;
+        Plat.clear();
         Calls = 0;
         Ghosts[0] = Ghosts[1] = Ghost();
     }
@@ -696,18 +827,21 @@ private:
     static constexpr int EnemyBottom = 104, EnemyGapLeft = 100, EnemyGapRight = 126;
     // Where the two Pokémon stand on the screen.
     static constexpr int EnemyX = 192, EnemyY = 56, PlayerX = 60, PlayerY = 105;
-    std::vector<uint32_t> Pixels, Picture, Plain;
-    std::vector<uint8_t> Fg, Move, Comp, Ui;
+    std::vector<uint32_t> Pixels, Picture, Plain, Snap;
+    std::vector<uint8_t> Fg, Move, MoveP, Comp, Ui;
     std::vector<int> Members;
     std::vector<uint8_t> Label;
-    std::vector<uint32_t> Back, Row;
+    std::vector<uint32_t> Back, Row, PlatNow, Plat;
     std::vector<uint8_t> BackPrio;
     std::vector<uint8_t> RowFlat, RowPrio;
     std::vector<uint32_t> RowColour;
     std::vector<uint8_t> EdgePrio;   // per row, left and right: priority of the background at the screen's edge
     float Glide = 0;
+    bool Settled = false;
+    int PlatL = 0, PlatR = 0, PlatT = 0, PlatB = 0;   // the wild Pokémon's platform, as the sprite last showed it
     struct Box { int x, y, w, h; };
     std::vector<Box> Boxes;
+    std::vector<uint8_t> HpMask;   // where an HP box is drawn (the sprites at the front)
     // A trainer's sprites last seen across the left or the right edge of the screen.
     struct Ghost
     {

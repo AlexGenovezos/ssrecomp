@@ -181,7 +181,8 @@ private:
         }
 
         const ScreenImage& top = screens[scene.items[0].screen];
-        if (!top.flags) return;
+        if (!top.flags || (scene.items[0].drop & 0x7F) == 0x7F) return;
+        const uint8_t dropped = scene.items[0].drop;
         const int left = (int)v.originX, right = (int)(v.originX + 256 * v.unit);
         const int y0 = (int)v.originY, h = (int)(192 * v.unit + 0.5f);
         for (int side = 0; side < 2; side++)
@@ -190,7 +191,8 @@ private:
             bool any = false;
             for (int y = 0; y < 192; y++)
             {
-                bool ext = LayerClass(top.flags[y * 256 + sx]) != LAYER_3D;
+                const uint8_t lc = LayerClass(top.flags[y * 256 + sx]);
+                bool ext = lc != LAYER_3D && !(lc & dropped);
                 Edge[y] = ext ? (0xFF000000 | top.pixels[y * 256 + sx]) : 0;
                 any |= ext;
             }

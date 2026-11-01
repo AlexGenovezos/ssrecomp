@@ -932,6 +932,7 @@ struct Settings
     // switch screens. Off unless asked for: brushing the stick put the bottom screen up.
     bool padTouch = false;
     bool showFps = false; // frames shown per second, in a corner
+    int monLift = 6, groundLift = 0, playerGroundLift = 5; // the wild Pokemon's height above its ground, and the ground's, in a battle
 
     void Load(const std::string& path)
     {
@@ -953,6 +954,9 @@ struct Settings
             else if (k == "fps60") fps60 = v == "1";
             else if (k == "pad_touch") padTouch = v == "1";
             else if (k == "show_fps") showFps = v == "1";
+            else if (k == "mon_lift") monLift = std::clamp(atoi(v.c_str()), -20, 40);
+            else if (k == "ground_lift") groundLift = std::clamp(atoi(v.c_str()), -20, 40);
+            else if (k == "player_ground_lift") playerGroundLift = std::clamp(atoi(v.c_str()), -20, 40);
         }
     }
 
@@ -969,6 +973,9 @@ struct Settings
         f << "fps60=" << (fps60 ? 1 : 0) << "\n";
         f << "pad_touch=" << (padTouch ? 1 : 0) << "\n";
         f << "show_fps=" << (showFps ? 1 : 0) << "\n";
+        f << "mon_lift=" << monLift << "\n";
+        f << "ground_lift=" << groundLift << "\n";
+        f << "player_ground_lift=" << playerGroundLift << "\n";
     }
 };
 
@@ -1131,7 +1138,7 @@ int main(int argc, char** argv)
     const std::string quickState = opt.save + ".state";
 
     Settings cfg;
-    if (!opt.headless) cfg.Load(opt.config);
+    if (!opt.headless || getenv("SSR_LOAD_CFG")) cfg.Load(opt.config);
     if (opt.layoutGiven || opt.headless) cfg.layout = opt.layout;
     if (opt.fullscreen) cfg.fullscreen = true;
     if (!opt.autoFocus) cfg.focusMode = 1;
@@ -1156,6 +1163,7 @@ int main(int argc, char** argv)
     LayoutMode preSingleLayout = LayoutMode::Merged;
     uint32_t singleFieldFrame = 0; // the last frame the overworld ran in a single-screen build
     bool singleScreenRom = false; // a SINGLE_SCREEN build of the decompilation (see the main loop)
+    unsigned singleScreenScanCount = 0; // count scans, including when restoring a late snapshot
     AutoFocus focus;
     focus.mode = cfg.focusMode;
     focus.manualFlip = opt.swapped;
@@ -1398,8 +1406,35 @@ int main(int argc, char** argv)
     bool appBottomNow = false;
     // The command strip's own cursor: d-pad presses seen by the frontend this frame, and the
     // selection they have moved it to (reset whenever the ROM's published selection changes).
+    // The last frame the battle overlay ran; the overworld's picture is held wide for a while after it.
+    uint32_t battleSeen = 0;
     std::string stripNav; int stripSel = 0, stripPubSel = -1, stripPubMenu = 0;
     // Chooses what the single merged view shows this frame.
+    // The start-menu probe flickers while the ROM slides the menu in; hold it for a few frames so the panel stays put.
+    // age counts frames since the held state began (0 when not held).
+    uint32_t xPressed = 0, bPressed = 0;
+    bool menuUnconfirmed = false; // menuHeld is true only on the X press so far; the probe has not seen a menu
+    bool menuShown = false; // the start menu was composed as open on the last frame
+    auto menuHeld = [&](unsigned* age = nullptr) {
+        static unsigned lastOn = 0, since = 0, lastCalled = ~0u;
+        static bool fromX = false;
+        const unsigned f = rc_current_frame();
+        if (f != lastCalled)
+        {
+            lastCalled = f;
+            const unsigned lat = fromX ? 0 : bPressed && f - bPressed <= 30 ? 1 : 8; // fromX: the probe hasn't confirmed a menu // closing: drop the latch as soon as the probe ends
+            const bool held = lastOn && f - lastOn <= lat;
+            if (probeActive(probeStartMenu) && fieldActive()) { if (!held || fromX) since = f; lastOn = f; fromX = false; }
+            // The probe lags the X press by a few frames, and the ROM's setup frames in between are garbage.
+            else if (xPressed && f - xPressed <= 3 && fieldActive()) { if (!held) { since = f; fromX = true; } lastOn = f; }
+            else if (!held) lastOn = 0;
+        }
+        const unsigned lat = fromX ? 0 : bPressed && f - bPressed <= 30 ? 1 : 8; // fromX: the probe hasn't confirmed a menu
+        const bool held = lastOn && f - lastOn <= lat;
+        menuUnconfirmed = held && fromX;
+        if (age) *age = held ? f - since : 0;
+        return held;
+    };
     auto pickScene = [&](bool cursorInUse, float viewWidth, const ScreenImage* screens) {
         Scene sc;
         auto only = [&](const char* name, int screen) {
@@ -1411,7 +1446,10 @@ int main(int argc, char** argv)
             // The game has put everything on the visible screen: the world is widened on a wide
             // view, a battle's edges are continued, and any other screen's bars take its colours.
             only("single", 0);
-            if (sectionActive("OVY_12"))
+            // The battle overlay's code skips a frame now and then (on a d-pad press, for one), so it
+            // gets a short memory, or the widescreen picture would drop out for that frame.
+            if (sectionActive("OVY_12")) battleSeen = rc_current_frame() ? rc_current_frame() : 1;
+            if (!fieldActive() && (sectionActive("OVY_12") || (battleSeen && singleScreenFlag[1] && rc_current_frame() - battleSeen < 8)))
             {
                 sc.name = "battle";
                 // The bag and party screens are 4:3 pages: no scene to continue past their edges.
@@ -1428,13 +1466,15 @@ int main(int argc, char** argv)
                                  : k == 'U' ? (stripSel >= 2 ? stripSel - 2 : stripSel)
                                             : (stripSel < 2 ? stripSel + 2 : stripSel);
                 stripNav.clear();
-                const int shown = (menu == 1 || menu == 2) ? stripSel : sel;
+                const int shown = (menu == 1 || menu == 2) ? stripSel : menu == 4 ? sel - 1 : sel; // moves are published as 1..4 (0 is cancel)
                 if (viewWidth >= 300 && (menu == 1 || menu == 2 || menu == 4))
                 {
                     const float L = 128 - viewWidth / 2;
                     sc.name = menu == 4 ? "battle-moves" : "battle-cmd";
-                    sc.items.push_back(FillRect(L, 137, (int)viewWidth + 1, 55, 0x20242C));
-                    sc.items.push_back(FillRect(L, 137, (int)viewWidth + 1, 1, 0x5A6270));
+                    // The moves keep the ROM's 2x2 grid (type and PP in each button); the bars beside it are filled in.
+                    const int top = menu == 4 ? 128 : 137;
+                    sc.items.push_back(FillRect(L, top, (int)viewWidth + 1, 192 - top, 0x20242C));
+                    sc.items.push_back(FillRect(L, top, (int)viewWidth + 1, 1, 0x5A6270));
                     Element label = { 0, 16, 153, 62, 16, L + 4.5f, 139.5f, 1.0f, 0, 255, false };
                     Element label2 = { 0, 16, 169, 80, 16, L + 64.5f, 139.5f, 1.0f, 0, 255, false };
                     if (menu != 4) {
@@ -1445,15 +1485,15 @@ int main(int argc, char** argv)
                     const size_t firstButton = sc.items.size();
                     const float gap = 6;
                     const bool moves = menu == 4;
-                    const int bw = moves ? 78 : 50, bh = moves ? 22 : 18;
-                    const float sb = std::min(33.0f / bh, (viewWidth - 8 - 3 * gap) / (4 * bw));
+                    const int bw = moves ? 108 : 50, bh = moves ? 29 : 18;
+                    const float sb = moves ? 1.0f : std::min(33.0f / bh, (viewWidth - 8 - 3 * gap) / (4 * bw));
                     float x = 128 - (4 * bw * sb + 3 * gap) / 2;
                     const float y = 156.5f + (33 - bh * sb) / 2;
                     for (int i = 0; i < 4; i++)
                     {
-                        const int sx = moves ? 5 + (i & 1) * 80 : 133 + (i & 1) * 52;
-                        const int sy = moves ? 141 + (i >> 1) * 24 : 149 + (i >> 1) * 20;
-                        Element b = { 0, sx, sy, bw, bh, x, y, sb, 0, 255, false };
+                        const int sx = moves ? 14 + (i & 1) * 120 : 133 + (i & 1) * 52;
+                        const int sy = moves ? 131 + (i >> 1) * 32 : 149 + (i >> 1) * 20;
+                        Element b = { 0, sx, sy, bw, bh, moves ? (float)sx : x, moves ? (float)sy : y, sb, 0, 255, false };
                         b.border = true;
                         b.borderColor = i == shown ? 0xF04040 : 0x101218;
                         b.borderWidth = i == shown ? 16 : 6;
@@ -1466,7 +1506,27 @@ int main(int argc, char** argv)
             else
             {
                 if (sectionActive("field")) singleFieldFrame = rc_current_frame();
-                sc.wide = viewWidth >= 300 && (fieldActive() || (singleFieldFrame && rc_current_frame() - singleFieldFrame < 20));
+                sc.wide = viewWidth >= 300 && (fieldActive() || (singleFieldFrame && rc_current_frame() - singleFieldFrame < 20) || (battleSeen && rc_current_frame() - battleSeen < 150));
+                // The X menu is drawn by the ROM on BG3 and sprites at the right of the 4:3 screen:
+                // on a wide view the world is shown without them and the panel stands at the view's right edge.
+                unsigned menuAge = 0;
+                menuShown = false;
+                if (sc.wide && menuHeld(&menuAge))
+                {
+                    sc.name = "start-menu";
+                    // B closes the menu; the ROM's slide-out frames are garbage too.
+                    const bool closing = bPressed && rc_current_frame() - bPressed <= 20;
+                    if (closing) menuAge = 0;
+                    menuShown = !closing;
+                    sc.items[0].drop = menuAge < 8 ? 0x7F : (LAYER_BG3 | LAYER_OBJ);
+                    if (menuAge < 8) sc.items[0].sw = 0;
+                    // Crop the ROM's pale side strips and grey frame so only the green menu body remains.
+                    const int pl = 93, pw = 158, ph = 186;
+                    const float ps = 192.0f / ph; // stretched to full height: the ROM windows out the 3D under the panel, which shows backdrop
+                    Element panel = { 0, pl, 0, pw, ph, 128 + viewWidth / 2 - pw * ps, 0, ps, (uint8_t)(LAYER_BG0 | LAYER_BG1 | LAYER_BG2 | LAYER_3D | LAYER_BACKDROP), 255, false };
+                    // The ROM's first menu frames are setup garbage: show the world alone until it settles.
+                    if (menuAge >= 8) sc.items.push_back(panel);
+                }
             }
             return sc;
         }
@@ -2297,7 +2357,7 @@ int main(int argc, char** argv)
     Menu menu;
     enum
     {
-        M_RESUME, M_LAYOUT, M_LARGE, M_FPS60, M_FULLSCREEN, M_SMOOTH, M_WIDE, M_WIDELINES, M_SHOWFPS, M_BUTTONS, M_PADTOUCH, M_FAST, M_SAVESTATE, M_LOADSTATE, M_RESET, M_QUIT
+        M_RESUME, M_LAYOUT, M_LARGE, M_FPS60, M_FULLSCREEN, M_SMOOTH, M_WIDE, M_WIDELINES, M_MONLIFT, M_GROUNDLIFT, M_SHOWFPS, M_BUTTONS, M_PADTOUCH, M_FAST, M_SAVESTATE, M_LOADSTATE, M_RESET, M_QUIT
     };
     bool fastLock = false;
     // World detail choices: the most lines the widescreen 3D is drawn at (192 is the DS's own).
@@ -2319,6 +2379,8 @@ int main(int argc, char** argv)
             { "SMOOTH SCALING", cfg.smooth ? "ON" : "OFF" },
             { "WIDESCREEN WORLD", cfg.wide ? "ON" : "OFF" },
             { "WORLD DETAIL", std::to_string(detailLines[detailIndex()]) },
+            { "POKEMON HEIGHT", std::to_string(cfg.monLift) },
+            { "GROUND HEIGHT", std::to_string(cfg.groundLift) },
             { "FPS COUNTER", cfg.showFps ? "ON" : "OFF" },
             { "BUTTONS", cfg.byLabel ? "BY LABEL" : "BY POSITION" },
             { "STICK TOUCH CURSOR", cfg.padTouch ? "ON" : "OFF" },
@@ -2759,6 +2821,12 @@ int main(int argc, char** argv)
             case M_WIDELINES:
                 cfg.wideLines = detailLines[(detailIndex() + (dir < 0 ? detailCount - 1 : 1)) % detailCount];
                 break;
+            case M_MONLIFT:
+                cfg.monLift = std::clamp(cfg.monLift + (dir < 0 ? -1 : 1), -20, 40);
+                break;
+            case M_GROUNDLIFT:
+                cfg.groundLift = std::clamp(cfg.groundLift + (dir < 0 ? -1 : 1), -20, 40);
+                break;
             case M_SHOWFPS:
                 cfg.showFps = !cfg.showFps;
                 break;
@@ -2828,8 +2896,9 @@ int main(int argc, char** argv)
         // A decompilation build with SINGLE_SCREEN puts everything on the engine of the touch
         // screen. It carries a tag, searched for in main memory once the game has unpacked itself,
         // and a flag next to it that the game sets while a scene needs both screens (the intro).
-        if (!singleScreenRom && !opt.layoutGiven && frame % 30 == 15 && frame < 1800)
+        if (!singleScreenRom && !opt.layoutGiven && frame % 30 == 15 && singleScreenScanCount < 60)
         {
+            ++singleScreenScanCount;
             static const char tag[] = "SSRECOMP-SINGLE-SCREEN-1";
             const uint8_t* ram = nds->MainRAM;
             const uint8_t* end = ram + nds->MainRAMMask + 1;
@@ -2870,7 +2939,7 @@ int main(int argc, char** argv)
                 wh = cfg.wideLines;
             }
             const bool wantWide = merged && cfg.wide && !opt.noWide && !opt.lockstep && view.width >= 300 &&
-                (fieldActive() || menuReturn > 0 || scene.edgeFill || (singleView() && singleFieldFrame && rc_current_frame() - singleFieldFrame < 20));
+                (fieldActive() || menuReturn > 0 || scene.edgeFill || (singleView() && ((singleFieldFrame && rc_current_frame() - singleFieldFrame < 20) || (battleSeen && rc_current_frame() - battleSeen < 150))));
             melonDS::Wide.Owner = wantWide ? &nds->GPU.GPU3D : nullptr;
             melonDS::Wide.ViewWidth = view.width;
             melonDS::Wide.Width = ww;
@@ -2895,19 +2964,51 @@ int main(int argc, char** argv)
                 const int tu = topUnitOf();
                 const ScreenImage topImage = { nds->GPU.Framebuffer[nds->GPU.FrontBuffer][singleView() ? 1 : 0].get(),
                     static_cast<GPU2D::SoftRenderer&>(nds->GPU.GetRenderer2D()).LayerFlags[tu] };
+                battleWide.MonLift = cfg.monLift;
+                battleWide.GroundLift = cfg.groundLift;
+                battleWide.PlayerGroundLift = cfg.playerGroundLift;
                 if (vw >= 300 && battleWide.Build(*nds, topImage, (int)std::ceil((vw - 256) / 2), &world, vw, wideImage, tu))
                 {
                     scene.wide = true;
                     return;
                 }
             }
-            else
+            else if (fieldActive() || (singleFieldFrame && rc_current_frame() - singleFieldFrame < 20))   // not for the bag or the party: the same battle goes on
                 battleWide.Reset();
             if (wideFrames > 3 && !melonDS::Wide.Front.empty())
             {
                 wideImage.pixels = melonDS::Wide.Front.data();
                 wideImage.w = melonDS::Wide.FrontW;
                 wideImage.h = melonDS::Wide.FrontH;
+                // The ROM redraws the world while its X menu slides in and out, and the widened
+                // picture goes bad then; the world stands still behind the menu, so a picture from
+                // before the menu opened stands in for it.
+                {
+                    struct Pic { std::vector<uint32_t> px; int w, h; };
+                    static std::deque<Pic> history;
+                    static int quiet = 100;
+                    static Pic frozen;
+                    const bool menuNow = singleView() && menuHeld() && !menuUnconfirmed;
+                    // The scene was picked before the menu showed: its first frames are the ROM's setup, hide them.
+                    if (menuNow && scene.items.size() == 1 && std::strcmp(scene.name, "start-menu")) { scene.wide = true; scene.items[0].drop = 0x7F; scene.items[0].sw = 0; }
+                    quiet = menuNow ? 0 : quiet + 1;
+                    if (quiet > 4)
+                    {
+                        history.push_back({ melonDS::Wide.Front, melonDS::Wide.FrontW, melonDS::Wide.FrontH });
+                        if (history.size() > 12) history.pop_front();
+                        frozen.px.clear();
+                    }
+                    else
+                    {
+                        if (frozen.px.empty() && !history.empty()) frozen = history.front();
+                        if (!frozen.px.empty())
+                        {
+                            wideImage.pixels = frozen.px.data();
+                            wideImage.w = frozen.w;
+                            wideImage.h = frozen.h;
+                        }
+                    }
+                }
                 // Fades: the game darkens or whitens its screen with the master brightness
                 // register, or with a brightness effect on the 3D layer.
                 int topUnit = topUnitOf();
@@ -2931,7 +3032,7 @@ int main(int argc, char** argv)
             {
                 // Where the widescreen picture comes and goes, and why.
                 static int last = -1;
-                int now = (wideImage.pixels ? 1 : 0) | (scene.wide ? 2 : 0) | (melonDS::Wide.Owner ? 4 : 0);
+                int now = (wideImage.pixels ? 1 : 0) | (scene.wide ? 2 : 0) | (melonDS::Wide.Owner ? 4 : 0) | (wideImage.fade << 3) | (wideImage.fadeMode << 9);
                 if (now != last)
                     fprintf(stderr, "[wide] frame %u: picture %d, scene %s wide %d, renderer on %d, fade %d/%d\n", frame,
                         now & 1, scene.name, (now >> 1) & 1, (now >> 2) & 1, wideImage.fadeMode, wideImage.fade);
@@ -2984,7 +3085,7 @@ int main(int argc, char** argv)
             static std::string stripKind;
             static uint32_t prevStripKeys = 0;
             static int stripTouch = 0, stripTouchX = 0, stripTouchY = 0;
-            const bool cmd = merged && !strcmp(scene.name, "battle-cmd"), moves = merged && !strcmp(scene.name, "battle-moves");
+            const bool cmd = merged && !strcmp(scene.name, "battle-cmd"), moves = merged && !strcmp(scene.name, "battle-moves") && !singleScreenFlag; // the ROM reads keys itself in its move list
             if (!paused && (cmd || moves))
             {
                 if (stripKind != scene.name)
@@ -3063,6 +3164,13 @@ int main(int argc, char** argv)
         if (!paused)
         {
             nds->SetKeyMask(~keys & 0xFFF);
+            {
+                static bool prevX = false;
+                const bool nowX = keys & (1u << KEY_X);
+                if (nowX && !prevX) { xPressed = rc_current_frame(); bPressed = menuShown ? xPressed : 0; } // X on an open menu closes it
+                prevX = nowX;
+            }
+            if (keys & (1u << KEY_B)) bPressed = rc_current_frame();
             if (touching) nds->TouchScreen((u16)touchX, (u16)touchY);
             else nds->ReleaseScreen();
 
@@ -3074,6 +3182,8 @@ int main(int argc, char** argv)
                 if (avail > (int)audioBuf.size() / 2) avail = (int)audioBuf.size() / 2;
                 int n = nds->SPU.ReadOutput(audioBuf.data(), avail);
                 if (i == 0) got = n; // when fast-forwarding only the first frame's audio is played
+                static FILE* rawAudio = getenv("SSR_RAW_AUDIO") ? fopen(getenv("SSR_RAW_AUDIO"), "wb") : nullptr;
+                if (rawAudio && n > 0) fwrite(audioBuf.data(), 4, n, rawAudio);
             }
         }
         perfMark(1);
@@ -3193,7 +3303,8 @@ int main(int argc, char** argv)
                 if (probeActive(probeStartMenu) && fieldActive()) menuReturn = 0;
                 else if (strip && merged) menuReturn = 30;
                 else if (menuReturn > 0) menuReturn--;
-                bool menuOpen = merged && ((probeActive(probeStartMenu) && fieldActive()) || menuReturn > 0);
+                // (Not in a single-screen build: there the menu is drawn on those very layers.)
+                bool menuOpen = merged && !singleView() && ((probeActive(probeStartMenu) && fieldActive()) || menuReturn > 0);
                 rc_hide_layers[topUnit] = menuOpen ? 0x18 : 0;
                 rc_hide_layers[1 - topUnit] = 0;
             }

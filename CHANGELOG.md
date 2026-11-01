@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Keep save, shop and choice-menu screen detection working when building from
+  the game fork's renamed functions.
+- Restoring a later snapshot still detects a single-screen game correctly.
+- Native builds can read linked `.elf` output from the single-screen game fork
+  as well as the original `.nef` output.
+- Use the frontend shipped with the single-screen game fork for its battle,
+  party and field menus.
+- macOS builds download SDL2 from its GitHub release mirror to avoid the
+  repeated download timeouts from libsdl.org.
 - The setup program for macOS can now check for updates and update itself from
   the setup window and with `--update`, matching Linux and Windows.
 - A single-screen build of the decompilation (the one-screen game) is recognised when it

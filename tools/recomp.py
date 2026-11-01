@@ -17,6 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import recomp_inline
+from build_files import linked_image
 
 try:
     from elftools.elf.elffile import ELFFile   # only needed with a build directory
@@ -107,11 +108,10 @@ def load_sections_from_layout(layout_path, rom_path):
 
 
 def load_sections(build_dir):
-    nef = [f for f in os.listdir(build_dir) if f.endswith('.nef')]
-    assert len(nef) == 1, nef
+    nef = linked_image(build_dir)
     maps = collections.defaultdict(list)
     named = collections.defaultdict(set)
-    with open(os.path.join(build_dir, nef[0]), 'rb') as f:
+    with open(os.path.join(build_dir, nef), 'rb') as f:
         elf = ELFFile(f)
         secinfo = [(s.name, s['sh_addr']) for s in elf.iter_sections()]
         for sym in elf.get_section_by_name('.symtab').iter_symbols():
