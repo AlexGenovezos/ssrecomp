@@ -1,5 +1,6 @@
 # Generated from your own game build: never commit (it is the game's code).
 /gen/
+/gen-qol-ui/
 # Build output
 /build/
 /build-*/

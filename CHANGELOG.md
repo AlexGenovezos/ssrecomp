@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Tidy battle move cards with a thinner gold selection outline, clearer type
+  and PP spacing, and quieter empty slots. Touching a move chooses the shown
+  card, and player health panels leave the moves clear in doubles.
 - Rebuilding after game changes refreshes the embedded section images, avoiding
   stale data that forced the new build back to the interpreter.
 - Keep save, shop and choice-menu screen detection working when building from
